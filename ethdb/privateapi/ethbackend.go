@@ -244,15 +244,38 @@ func (s *EthBackendServer) Block(ctx context.Context, req *remote.BlockRequest) 
 	return &remote.BlockReply{BlockRlp: blockRlp, Senders: sendersBytes}, nil
 }
 
-func convertPayloadStatus(payloadStatus *PayloadStatus) *remote.EnginePayloadStatus {
+func (s *EthBackendServer) convertPayloadStatus(ctx context.Context, payloadStatus *PayloadStatus) (*remote.EnginePayloadStatus, error) {
 	reply := remote.EnginePayloadStatus{Status: payloadStatus.Status}
-	if payloadStatus.LatestValidHash != (common.Hash{}) {
+
+	latestValidIsPoW := false
+	if payloadStatus.Status == remote.EngineStatus_INVALID {
+		// Per the Engine API spec: If the most recent valid ancestor is a PoW block,
+		// latestValidHash MUST be set to 0x0000000000000000000000000000000000000000000000000000000000000000
+		tx, err := s.db.BeginRo(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		header, err := rawdb.ReadHeaderByHash(tx, payloadStatus.LatestValidHash)
+		if err != nil {
+			return nil, err
+		}
+		if header == nil {
+			log.Warn("Failed to read latest valid header", "LatestValidHash", payloadStatus.LatestValidHash)
+		} else {
+			latestValidIsPoW = header.Difficulty.Cmp(common.Big0) != 0
+		}
+	}
+	if latestValidIsPoW {
+		reply.LatestValidHash = gointerfaces.ConvertHashToH256(common.Hash{})
+	} else if payloadStatus.LatestValidHash != (common.Hash{}) {
 		reply.LatestValidHash = gointerfaces.ConvertHashToH256(payloadStatus.LatestValidHash)
 	}
+
 	if payloadStatus.ValidationError != nil {
 		reply.ValidationError = payloadStatus.ValidationError.Error()
 	}
-	return &reply
+	return &reply, nil
 }
 
 func (s *EthBackendServer) stageLoopIsBusy() bool {
@@ -361,7 +384,7 @@ func (s *EthBackendServer) EngineNewPayloadV1(ctx context.Context, req *types2.E
 		return nil, payloadStatus.CriticalError
 	}
 
-	return convertPayloadStatus(&payloadStatus), nil
+	return s.convertPayloadStatus(ctx, &payloadStatus)
 }
 
 // EngineGetPayloadV1 retrieves previously assembled payload (Validators only)
@@ -471,7 +494,11 @@ func (s *EthBackendServer) EngineForkChoiceUpdatedV1(ctx context.Context, req *r
 
 	// No need for payload building
 	if req.PayloadAttributes == nil || status.Status != remote.EngineStatus_VALID {
-		return &remote.EngineForkChoiceUpdatedReply{PayloadStatus: convertPayloadStatus(&status)}, nil
+		res, err := s.convertPayloadStatus(ctx, &status)
+		if err != nil {
+			return nil, err
+		}
+		return &remote.EngineForkChoiceUpdatedReply{PayloadStatus: res}, nil
 	}
 
 	if !s.proposing {
@@ -498,7 +525,11 @@ func (s *EthBackendServer) EngineForkChoiceUpdatedV1(ctx context.Context, req *r
 
 		log.Warn("Skipping payload building because forkchoiceState.headBlockHash is not the head of the canonical chain",
 			"forkChoice.HeadBlockHash", forkChoice.HeadBlockHash, "headHeader.Hash", headHeader.Hash())
-		return &remote.EngineForkChoiceUpdatedReply{PayloadStatus: convertPayloadStatus(&status)}, nil
+		res, err := s.convertPayloadStatus(ctx, &status)
+		if err != nil {
+			return nil, err
+		}
+		return &remote.EngineForkChoiceUpdatedReply{PayloadStatus: res}, nil
 	}
 
 	if headHeader.Time >= req.PayloadAttributes.Timestamp {
