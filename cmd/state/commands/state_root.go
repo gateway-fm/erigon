@@ -124,6 +124,7 @@ func StateRoot(genesis *core.Genesis, logger log.Logger, blockNum uint64, datadi
 		if tx, err = db.BeginRo(ctx); err != nil {
 			return err
 		}
+		defer tx.Rollback()
 		if rwTx, err = db.BeginRw(ctx); err != nil {
 			return err
 		}
