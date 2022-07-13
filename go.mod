@@ -36,7 +36,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/julienschmidt/httprouter v1.3.0
 	github.com/kevinburke/go-bindata v3.21.0+incompatible
-	github.com/ledgerwatch/erigon-lib v0.0.0-20220710110825-21c6baf2871c
+	github.com/ledgerwatch/erigon-lib v0.0.0-20220713123745-d629e31df75e
 	github.com/ledgerwatch/log/v3 v3.4.1
 	github.com/ledgerwatch/secp256k1 v1.0.0
 	github.com/nxadm/tail v1.4.9-0.20211216163028-4472660a31a6
@@ -165,5 +165,6 @@ require (
 
 require (
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
+	github.com/matryer/moq v0.2.7 // indirect
 	gotest.tools/v3 v3.3.0 // indirect
 )
