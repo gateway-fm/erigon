@@ -14,6 +14,7 @@
 package engineapi
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/remote"
@@ -22,6 +23,7 @@ import (
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/log/v3"
 )
 
@@ -47,6 +49,8 @@ type ForkValidator struct {
 	extendingForkHeadHash common.Hash
 	// this is the function we use to perform payload validation.
 	validatePayload validatePayloadFunc
+	// this is the current point where we processed the chain so far.
+	currentHeight uint64
 }
 
 // abs64 is a utility method that given an int64, it returns its absolute value in uint64.
@@ -57,22 +61,29 @@ func abs64(n int64) uint64 {
 	return uint64(n)
 }
 
-func NewForkValidatorMock() *ForkValidator {
+func NewForkValidatorMock(currentHeight uint64) *ForkValidator {
 	return &ForkValidator{
 		sideForksBlock: make(map[common.Hash]forkSegment),
+		currentHeight:  currentHeight,
 	}
 }
 
-func NewForkValidator(validatePayload validatePayloadFunc) *ForkValidator {
+func NewForkValidator(currentHeight uint64, validatePayload validatePayloadFunc) *ForkValidator {
 	return &ForkValidator{
 		sideForksBlock:  make(map[common.Hash]forkSegment),
 		validatePayload: validatePayload,
+		currentHeight:   currentHeight,
 	}
 }
 
 // ExtendingForkHeadHash return the fork head hash of the fork that extends the canonical chain.
 func (fv *ForkValidator) ExtendingForkHeadHash() common.Hash {
 	return fv.extendingForkHeadHash
+}
+
+// NotifyCurrentHeight is to be called at the end of the stage cycle and repressent the last processed block.
+func (fv *ForkValidator) NotifyCurrentHeight(currentHeight uint64) {
+	fv.currentHeight = currentHeight
 }
 
 // FlushExtendingFork flush the current extending fork if fcu chooses its head hash as the its forkchoice.
@@ -97,12 +108,7 @@ func (fv *ForkValidator) ValidatePayload(tx kv.RwTx, header *types.Header, body 
 		status = remote.EngineStatus_ACCEPTED
 		return
 	}
-	currentHeight := rawdb.ReadCurrentBlockNumber(tx)
-	if currentHeight == nil {
-		criticalError = fmt.Errorf("could not read block number.")
-		return
-	}
-	defer fv.clean(*currentHeight)
+	defer fv.clean()
 
 	if extendCanonical {
 		// If the new block extends the canonical chain we update extendingFork.
@@ -113,17 +119,7 @@ func (fv *ForkValidator) ValidatePayload(tx kv.RwTx, header *types.Header, body 
 		}
 		// Update fork head hash.
 		fv.extendingForkHeadHash = header.Hash()
-		// Let's assemble the side fork chain if we have others building.
-		validationError = fv.validatePayload(fv.extendingFork, header, body, 0, nil, nil)
-		if validationError != nil {
-			status = remote.EngineStatus_INVALID
-			latestValidHash = header.ParentHash
-			return
-		}
-		status = remote.EngineStatus_VALID
-		latestValidHash = header.Hash()
-		fv.sideForksBlock[latestValidHash] = forkSegment{header, body}
-		return
+		return fv.validateAndStorePayload(fv.extendingFork, header, body, 0, nil, nil)
 	}
 	// If the block is stored within the side fork it means it was already validated.
 	if _, ok := fv.sideForksBlock[header.Hash()]; ok {
@@ -133,8 +129,9 @@ func (fv *ForkValidator) ValidatePayload(tx kv.RwTx, header *types.Header, body 
 	}
 
 	// if the block is not in range of maxForkDepth from head then we do not validate it.
-	if abs64(int64(*currentHeight)-header.Number.Int64()) > maxForkDepth {
+	if abs64(int64(fv.currentHeight)-header.Number.Int64()) > maxForkDepth {
 		status = remote.EngineStatus_ACCEPTED
+		fmt.Println("not in range")
 		return
 	}
 	// Let's assemble the side fork backwards
@@ -142,6 +139,7 @@ func (fv *ForkValidator) ValidatePayload(tx kv.RwTx, header *types.Header, body 
 	currentHash := header.ParentHash
 	foundCanonical, criticalError = rawdb.IsCanonicalHash(tx, currentHash)
 	if criticalError != nil {
+		fmt.Println("critical")
 		return
 	}
 
@@ -165,19 +163,14 @@ func (fv *ForkValidator) ValidatePayload(tx kv.RwTx, header *types.Header, body 
 		}
 		unwindPoint = sb.header.Number.Uint64() - 1
 	}
-	status = remote.EngineStatus_VALID
-	// if it is not canonical we validate it as a side fork.
+	// Do not set an unwind point if we are already there.
+	if unwindPoint == fv.currentHeight {
+		unwindPoint = 0
+	}
+	// if it is not canonical we validate it in memory and discard it aferwards.
 	batch := memdb.NewMemoryBatch(tx)
 	defer batch.Close()
-	validationError = fv.validatePayload(batch, header, body, unwindPoint, headersChain, bodiesChain)
-	latestValidHash = header.Hash()
-	if validationError != nil {
-		latestValidHash = header.ParentHash
-		status = remote.EngineStatus_INVALID
-		return
-	}
-	fv.sideForksBlock[header.Hash()] = forkSegment{header, body}
-	return
+	return fv.validateAndStorePayload(batch, header, body, unwindPoint, headersChain, bodiesChain)
 }
 
 // Clear wipes out current extending fork data, this method is called after fcu is called,
@@ -194,15 +187,49 @@ func (fv *ForkValidator) Clear(tx kv.RwTx) {
 		}
 		fv.extendingFork.Rollback()
 	}
-	// Clean all data relative to txpool
 	fv.extendingForkHeadHash = common.Hash{}
 	fv.extendingFork = nil
 }
 
+// validateAndStorePayload validate and store a payload fork chain if such chain results valid.
+func (fv *ForkValidator) validateAndStorePayload(tx kv.RwTx, header *types.Header, body *types.RawBody, unwindPoint uint64, headersChain []*types.Header, bodiesChain []*types.RawBody) (status remote.EngineStatus, latestValidHash common.Hash, validationError error, criticalError error) {
+	validationError = fv.validatePayload(tx, header, body, unwindPoint, headersChain, bodiesChain)
+	latestValidHash = header.Hash()
+	if validationError != nil {
+		latestValidHash = header.ParentHash
+		status = remote.EngineStatus_INVALID
+		return
+	}
+	// If we do not have the body we can recover it from the batch.
+	if body == nil {
+		var bodyWithTxs *types.Body
+		bodyWithTxs, criticalError = rawdb.ReadBodyWithTransactions(tx, header.Hash(), header.Number.Uint64())
+		if criticalError != nil {
+			return
+		}
+		var encodedTxs [][]byte
+		buf := bytes.NewBuffer(nil)
+		for _, tx := range bodyWithTxs.Transactions {
+			buf.Reset()
+			if criticalError = rlp.Encode(buf, tx); criticalError != nil {
+				return
+			}
+			encodedTxs = append(encodedTxs, common.CopyBytes(buf.Bytes()))
+		}
+		fv.sideForksBlock[header.Hash()] = forkSegment{header, &types.RawBody{
+			Transactions: encodedTxs,
+		}}
+	} else {
+		fv.sideForksBlock[header.Hash()] = forkSegment{header, body}
+	}
+	status = remote.EngineStatus_VALID
+	return
+}
+
 // clean wipes out all outdated sideforks whose distance exceed the height of the head.
-func (fv *ForkValidator) clean(currentHeight uint64) {
+func (fv *ForkValidator) clean() {
 	for hash, sb := range fv.sideForksBlock {
-		if abs64(int64(currentHeight)-sb.header.Number.Int64()) > maxForkDepth {
+		if abs64(int64(fv.currentHeight)-sb.header.Number.Int64()) > maxForkDepth {
 			delete(fv.sideForksBlock, hash)
 		}
 	}
