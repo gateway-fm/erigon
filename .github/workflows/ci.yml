@@ -121,4 +121,4 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           
       - name: run python tests
-        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock gatewayfm/automated-testing:erigon-latest
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock gatewayfm/automated-testing:erigon-latest --url=http://localhost:8545
