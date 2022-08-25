@@ -1,15 +1,14 @@
 name: Continuous integration
-on:
-  push:
-    branches:
-      - devel
-      - alpha
-      - stable
-  pull_request:
-    branches:
-      - devel
-      - alpha
-      - stable
+on: push
+#     branches:
+#       - devel
+#       - alpha
+#       - stable
+#   pull_request:
+#     branches:
+#       - devel
+#       - alpha
+#       - stable
 jobs:
   tests:
     strategy:
@@ -114,3 +113,12 @@ jobs:
 
       - name: run hive
         run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock gatewayfm/hive:latest --sim ethereum/sync --client erigon_ci-$GITHUB_SHA --docker.output --loglevel 5
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: run python tests
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock gatewayfm/automated-testing:erigon-latest --url=http://localhost:8545
